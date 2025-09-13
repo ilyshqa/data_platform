@@ -1,0 +1,59 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: analytics
+      POSTGRES_PASSWORD: analytics
+      POSTGRES_DB: dw
+    ports:
+      - "15432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  minio:
+    image: minio/minio:RELEASE.2024-06-13T22-53-53Z.fips
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Console
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: adminadmin
+    volumes:
+      - minio_data:/data
+
+  airflow:
+    image: apache/airflow:2.9.2-python3.11
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_started
+      minio:
+        condition: service_started
+    ports:
+      - "8080:8080"
+    environment:
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__WEBSERVER__SECRET_KEY: "95865749bf3273f629e812db240835369be1ae8374afb8e1c0cdf274e5f407b1"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "postgresql+psycopg2://analytics:analytics@postgres:5432/airflow"
+      _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary boto3 minio"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./etl:/opt/airflow/etl
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+    command: >
+      bash -lc "
+      airflow db init || true &&
+      airflow db migrate || true &&
+      airflow users create --username ilyshqa --password admin --firstname I --lastname L --role Admin --email you@example.org || true &&
+      airflow users reset-password --username ilyshqa --password admin &&
+      airflow webserver -H 0.0.0.0 -p 8080 &
+      airflow scheduler
+      "
+
+volumes:
+  minio_data:
+  pg_data:
