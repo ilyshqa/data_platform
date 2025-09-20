@@ -1,0 +1,6 @@
+id,name,unit,fact,deleted
+5,даша,ж,3333,False
+1,саша,м,3213,False
+2,паша,м,3123,False
+3,дима,м,1112,True
+4,вика,ж,123,False

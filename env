@@ -1,0 +1,8 @@
+DB_URL=postgresql+psycopg2://analytics:analytics@postgres:5432/load_excel?sslmode=prefer
+DB_SCHEMA=public
+
+PORT=8501
+STREAMLIT_SERVER_ADDRESS=0.0.0.0
+STREAMLIT_ENABLE_CORS=false
+STREAMLIT_ENABLE_XSRF_PROTECTION=false
+STREAMLIT_MAX_UPLOAD_SIZE=200

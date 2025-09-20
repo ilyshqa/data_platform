@@ -1,0 +1,30 @@
+pipeline_id: demo_localcsv_to_pg
+schedule: "0 9 * * *"
+retries: 1
+tags: ["demo", "generated"]
+source:
+  type: local_csv
+  path: examples/data/users.csv
+  options: { delimiter: ",", header: true }
+transforms:
+  - type: select
+    columns: [id, email, country, created_at]
+  - type: cast
+    columns:
+      id: int
+      created_at: timestamp
+  - type: filter
+    expr: "country in ['AT','DE','CH']"
+target:
+  type: postgres
+  conn_id: pg_dw
+  table: dim_users
+  mode: append
+  batch_size: 10000
+quality_checks:
+  - type: not_null
+    column: id
+  - type: unique
+    columns: [id]
+  - type: row_count_min
+    min: 1

@@ -1,0 +1,4 @@
+id,email,country,created_at
+1,alice@example.com,AT,2024-01-10 08:15:00
+2,bob@example.com,DE,2024-02-11 09:20:00
+3,charlie@example.com,US,2024-03-12 10:25:00

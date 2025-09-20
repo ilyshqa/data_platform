@@ -8,6 +8,7 @@ services:
       POSTGRES_DB: dw
     ports:
       - "15432:5432"
+    command: ["postgres", "-c", "listen_addresses=*"]
     volumes:
       - pg_data:/var/lib/postgresql/data
 
@@ -23,49 +24,253 @@ services:
       MINIO_ROOT_PASSWORD: adminadmin
     volumes:
       - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
 
-  airflow:
+  airflow-scheduler:
     image: apache/airflow:2.9.2-python3.11
     restart: unless-stopped
     depends_on:
       postgres:
         condition: service_started
-      minio:
+    environment:
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__EXECUTOR: "LocalExecutor"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "postgresql+psycopg2://analytics:analytics@postgres:5432/dw"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__WEBSERVER__SECRET_KEY: "95865749bf3273f629e812db240835369be1ae8374afb8e1c0cdf274e5f407b1"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_PRE_PING: "True"
+      _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary boto3 minio s3fs pandas openpyxl SQLAlchemy"
+    volumes:
+      - dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+    command: >
+      bash -lc '
+        until pg_isready -h postgres -p 5432 -U analytics; do echo "waiting for postgres..."; sleep 2; done
+        airflow db upgrade
+        # создаём админа только если его ещё нет
+        airflow users list | grep -q "^ *ilyshqa " || airflow users create
+          --username ilyshqa --password admin --firstname I --lastname L --role Admin --email you@example.com
+        exec airflow scheduler
+      '
+
+  airflow-webserver:
+    image: apache/airflow:2.9.2-python3.11
+    restart: unless-stopped
+    depends_on:
+      airflow-scheduler:
         condition: service_started
     ports:
       - "8080:8080"
     environment:
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__EXECUTOR: "LocalExecutor"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "postgresql+psycopg2://analytics:analytics@postgres:5432/dw"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
       AIRFLOW__WEBSERVER__SECRET_KEY: "95865749bf3273f629e812db240835369be1ae8374afb8e1c0cdf274e5f407b1"
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "postgresql+psycopg2://analytics:analytics@postgres:5432/airflow"
-      _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary boto3 minio s3fs"
-      # AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
-      AIRFLOW__CORE__DAGS_FOLDER: "s3://airflow-dags"
-      # AIRFLOW__CORE__REMOTE_DAGS: "True"
-      # AIRFLOW__CORE__REMOTE_DAGS_CONN_ID: "minio_dags"
-      AWS_ACCESS_KEY_ID: admin
-      AWS_SECRET_ACCESS_KEY: adminadmin
-      AWS_DEFAULT_REGION: us-east-1
-      AWS_ENDPOINT_URL: "http://minio:9000"
-      S3_ENDPOINT: "http://minio:9000"
-      # AIRFLOW__CORE__REMOTE_LOGGING: "False"   # пока только DAGs, логи оставим локально
-      # AIRFLOW__CORE__REMOTE_BASE_LOG_FOLDER: s3://airflow-logs/
-      # AIRFLOW__CORE__S3_ENDPOINT: http://minio:9000
+      _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary boto3 minio s3fs pandas openpyxl SQLAlchemy"
     volumes:
-     # - ./dags:/opt/airflow/dags
-     # - ./etl:/opt/airflow/etl
+      - dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs
       - ./plugins:/opt/airflow/plugins
     command: >
-      bash -lc "
-      airflow db init || true &&
-      airflow db migrate || true &&
-      airflow users create --username ilyshqa --password admin --firstname I --lastname L --role Admin --email you@example.org || true &&
-      airflow users reset-password --username ilyshqa --password admin &&
-      airflow webserver -H 0.0.0.0 -p 8080 &
-      airflow scheduler
-      "
+      bash -lc '
+        exec airflow webserver -H 0.0.0.0 -p 8080
+      '
+
+  dags-sync:
+    image: bitnami/minio-client:latest
+    restart: unless-stopped
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      # alias через переменную, без записи системного конфига
+      MC_HOST_minio: "http://admin:adminadmin@minio:9000"
+    volumes:
+      - dags:/dags
+    command:
+      - bash
+      - -lc
+      - |
+        set -euo pipefail
+        mkdir -p /dags
+
+        echo "[dags-sync] wait for MinIO..."
+        until mc ls minio >/dev/null 2>&1; do
+          echo "[dags-sync] retry..."; sleep 2
+        done
+
+        if ! mc ls minio/airflow-dags >/dev/null 2>&1; then
+          echo "[dags-sync] bucket 'airflow-dags' not found. Create it in Console and restart dags-sync."
+          exec sleep infinity
+        fi
+
+        echo "[dags-sync] initial mirror"
+        mc mirror --overwrite --remove minio/airflow-dags /dags || true
+        chmod -R a+rX /dags || true
+
+        echo "[dags-sync] watch mirror"
+        mc mirror --overwrite --remove --watch minio/airflow-dags /dags | while read _; do
+          chmod -R a+rX /dags || true
+        done
+
+  dags-puller:
+    image: python:3.11-alpine
+    restart: unless-stopped
+    environment:
+      ENDPOINT: "http://minio:9000"         # ИЛИ http://<IP-VM>:9000, если minio по имени недоступен
+      ACCESS_KEY: "admin"                   # можно вернуть к etl_user/etl_pass123, когда создашь пользователя
+      SECRET_KEY: "adminadmin"
+      BUCKET: "airflow-dags"                # если DAG-и лежат в подпапке — см. PREFIX ниже
+      PREFIX: ""                            # например "dags/" если файлы в airflow-dags/dags/
+      INTERVAL_SEC: "15"
+    volumes:
+      - dags:/dags
+    command:
+      - sh
+      - -lc
+      - |
+        set -euo pipefail
+        pip install --no-cache-dir boto3==1.34.162
+        cat > /sync.py <<'PY'
+        import os, time, sys, hashlib
+        import boto3
+        from botocore.config import Config
+        from urllib.parse import urlparse
+        ENDPOINT=os.getenv("ENDPOINT","http://minio:9000")
+        ACCESS_KEY=os.getenv("ACCESS_KEY")
+        SECRET_KEY=os.getenv("SECRET_KEY")
+        BUCKET=os.getenv("BUCKET","airflow-dags")
+        PREFIX=os.getenv("PREFIX","")
+        INTERVAL=int(os.getenv("INTERVAL_SEC","15"))
+        LOCAL="/dags"
+        s3=boto3.client(
+            "s3",
+            endpoint_url=ENDPOINT,
+            aws_access_key_id=ACCESS_KEY,
+            aws_secret_access_key=SECRET_KEY,
+            config=Config(signature_version="s3v4"),
+            region_name="us-east-1",
+        )
+        def etag2md5(etag):
+            etag=etag.strip('"')
+            # простая ветка без multipart
+            return etag if "-" in etag else etag
+        def list_remote():
+            keys={}
+            kwargs={"Bucket":BUCKET, "Prefix":PREFIX}
+            while True:
+                resp=s3.list_objects_v2(**kwargs)
+                for obj in resp.get("Contents", []):
+                    k=obj["Key"]
+                    if not k.endswith(".py"): # тянем только .py
+                        continue
+                    rel=k[len(PREFIX):] if PREFIX and k.startswith(PREFIX) else k
+                    if not rel:
+                        continue
+                    keys[rel]=obj["ETag"]
+                if resp.get("IsTruncated"):
+                    kwargs["ContinuationToken"]=resp["NextContinuationToken"]
+                else:
+                    break
+            return keys
+        def md5sum(path):
+            h=hashlib.md5()
+            with open(path,"rb") as f:
+                for chunk in iter(lambda: f.read(1024*1024), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        os.makedirs(LOCAL, exist_ok=True)
+        print("[dags-puller] start; endpoint:", ENDPOINT, "bucket:", BUCKET, "prefix:", PREFIX, flush=True)
+        while True:
+            try:
+                remote=list_remote()
+                # скачать/обновить
+                for rel, et in remote.items():
+                    dst=os.path.join(LOCAL, rel)
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    need=True
+                    if os.path.exists(dst):
+                        try:
+                            local_md5=md5sum(dst)
+                            # если etag без multipart — сравним
+                            if "-" not in et and local_md5==et.strip('"'):
+                                need=False
+                        except Exception: pass
+                    if need:
+                        print(f"[dags-puller] get {rel}", flush=True)
+                        s3.download_file(BUCKET, (PREFIX+rel) if PREFIX else rel, dst)
+                # удалить локальные, которых нет в бакете
+                for root,_,files in os.walk(LOCAL):
+                    for f in files:
+                        if not f.endswith(".py"): continue
+                        rel=os.path.relpath(os.path.join(root,f), LOCAL)
+                        if rel not in remote:
+                            print(f"[dags-puller] rm {rel}", flush=True)
+                            try: os.remove(os.path.join(LOCAL,rel))
+                            except FileNotFoundError: pass
+                # на всякий — права
+                try:
+                    os.system("chmod -R a+rX /dags >/dev/null 2>&1 || true")
+                except Exception: pass
+            except Exception as e:
+                print("[dags-puller] error:", e, file=sys.stderr, flush=True)
+            time.sleep(INTERVAL)
+        PY
+        python /sync.py
+
+  superset:
+    image: apache/superset:latest
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    ports:
+      - "8088:8088"   # если занят: "8090:8088"
+    environment:
+      SUPERSET_SECRET_KEY: "change_me_to_long_random_string"
+      SUPERSET_LOAD_EXAMPLES: "no"
+      SUPERSET_WEBSERVER_TIMEOUT: "120"
+    volumes:
+      - superset_home:/app/superset_home
+
+  ui-loader:
+   # build: ./opt/ui-loader
+    build: /home/ilyshqa/data-platform/opt/ui_loader/
+    image: ui-loader:latest
+    container_name: ui-loader
+    env_file:
+      - opt/ui_loader/.env
+    ports:
+      - "8501:8501"
+    volumes:
+    #  - ./ui-loader/storage:/app/storage
+      - /home/ilyshqa/data-platform/opt/ui_loader/storage:/app/storage
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8501/_stcore/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    # если у тебя внизу compose явно объявлены сети — подключи те же сети:
+    # networks:
+    #   - default
+    #   - <имя_сети_airflow>   # если используешь кастомные
+    # и, при наличии Postgres-сервиса в этом же файле:
+    depends_on:
+      - postgres
+    networks:
+      - default
+
 
 volumes:
-  minio_data:
   pg_data:
+  minio_data:
+  dags:
+  superset_home:
+    driver: local

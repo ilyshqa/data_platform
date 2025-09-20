@@ -1,0 +1,1 @@
+{"profiles": {"1": {"name": "load_excel", "db_url": "postgresql+psycopg2://analytics:analytics@158.160.43.121:15432/load_excel?sslmode=prefer", "schema": "public", "allowed_modes": ["append", "replace"]}}}
